@@ -153,21 +153,46 @@ static PHP_GINIT_FUNCTION(pcov)
 	ZEND_SECURE_ZERO(pcov_globals, sizeof(zend_pcov_globals));
 }
 
-static zend_always_inline zend_bool php_pcov_wants(zend_string *filename) { /* {{{ */
+static zend_always_inline zend_string* php_pcov_interned_string(zend_string *string) { /* {{{ */
+	if (ZSTR_IS_INTERNED(string)) {
+		return string;
+	}
+
+	return zend_new_interned_string(zend_string_copy(string));
+} /* }}} */
+
+static zend_never_inline php_pcov_file_t* php_pcov_file_create(zend_string *filename) { /* {{{ */
+	php_pcov_file_t file;
+
+	file.name    = NULL;
+	file.waiting = 0;
+
+	zend_hash_init(&file.covered, 64, NULL, NULL, 0);
+
+	return zend_hash_add_mem(
+		&PCG(wants), filename, &file, sizeof(php_pcov_file_t));
+} /* }}} */
+
+/* {{{ returns the record of a file that is traced, NULL for a file that is not */
+static zend_always_inline php_pcov_file_t* php_pcov_wants(zend_string *filename) {
+	php_pcov_file_t *file;
+
 	if (!PCG(directory)) {
-		return 1;
+		file = zend_hash_find_ptr(&PCG(wants), filename);
+
+		return file ? file : php_pcov_file_create(filename);
 	}
 
 	if (ZSTR_LEN(filename) < ZSTR_LEN(PCG(directory))) {
-		return 0;
+		return NULL;
 	}
 
-	if (zend_hash_exists(&PCG(wants), filename)) {
-		return 1;
+	if ((file = zend_hash_find_ptr(&PCG(wants), filename))) {
+		return file;
 	}
 
 	if (zend_hash_exists(&PCG(ignores), filename)) {
-		return 0;
+		return NULL;
 	}
 
 	if (strncmp(
@@ -197,16 +222,15 @@ static zend_always_inline zend_bool php_pcov_wants(zend_string *filename) { /* {
 			if (zend_is_true(&match)) {
 				zend_hash_add_empty_element(
 					&PCG(ignores), filename);
-				return 0;
+				return NULL;
 			}
 		}
 
-		zend_hash_add_empty_element(&PCG(wants), filename);
-		return 1;
+		return php_pcov_file_create(filename);
 	}
 
 	zend_hash_add_empty_element(&PCG(ignores), filename);
-	return 0;
+	return NULL;
 } /* }}} */
 
 static void php_pcov_fill_ignored_opcode_lut(void) {
@@ -253,56 +277,42 @@ static zend_always_inline zend_bool php_pcov_ignored_opcode(zend_uchar opcode) {
 	return zend_bitset_in(php_pcov_opcode_lut, opcode);
 } /* }}} */
 
-static zend_always_inline zend_string* php_pcov_interned_string(zend_string *string) { /* {{{ */
-	if (ZSTR_IS_INTERNED(string)) {
-		return string;
-	}
-
-	return zend_new_interned_string(zend_string_copy(string));
-} /* }}} */
-
-static zend_always_inline php_coverage_t* php_pcov_create(zend_execute_data *execute_data) { /* {{{ */
+static zend_always_inline php_coverage_t* php_pcov_create(zend_execute_data *execute_data, php_pcov_file_t *file) { /* {{{ */
 	php_coverage_t *create = (php_coverage_t*) zend_arena_alloc(&PCG(mem), sizeof(php_coverage_t));
 
-	create->file     = php_pcov_interned_string(EX(func)->op_array.filename);
+	if (UNEXPECTED(!file->waiting)) {
+		if (!file->name) {
+			file->name = php_pcov_interned_string(EX(func)->op_array.filename);
+		}
+
+		zend_hash_add_empty_element(&PCG(waiting), file->name);
+
+		file->waiting = 1;
+	}
+
+	create->file     = file->name;
 	create->line     = EX(opline)->lineno;
 	create->next     = NULL;
-
-	zend_hash_add_empty_element(&PCG(waiting), create->file);
 
 	return create;
 } /* }}} */
 
-static zend_always_inline int php_pcov_has(zend_string *filename, uint32_t lineno) { /* {{{ */
-	HashTable *table = zend_hash_find_ptr(&PCG(covered), filename);
-
-	if (UNEXPECTED(!table)) {
-		HashTable covering;
-
-		zend_hash_init(&covering, 64, NULL, NULL, 0);
-
-		table = zend_hash_add_mem(
-			&PCG(covered), filename, &covering, sizeof(HashTable));
-
- 		zend_hash_index_add_empty_element(table, lineno);
-		return 0;
-	}
-
-	if (EXPECTED(zend_hash_index_exists(table, lineno))) {
+static zend_always_inline int php_pcov_has(php_pcov_file_t *file, uint32_t lineno) { /* {{{ */
+	if (EXPECTED(zend_hash_index_exists(&file->covered, lineno))) {
 		return 1;
 	}
 
-	zend_hash_index_add_empty_element(table, lineno);
+	zend_hash_index_add_empty_element(&file->covered, lineno);
 	return 0;
 } /* }}} */
 
-static zend_always_inline int php_pcov_trace(zend_execute_data *execute_data, zend_bool wanted) { /* {{{ */
+static zend_always_inline int php_pcov_trace(zend_execute_data *execute_data, php_pcov_file_t *file) { /* {{{ */
     if (PCG(enabled)) {
-		if (wanted &&
+		if (file &&
 			!php_pcov_ignored_opcode(EX(opline)->opcode) &&
-			!php_pcov_has(EX(func)->op_array.filename, EX(opline)->lineno)) {
+			!php_pcov_has(file, EX(opline)->lineno)) {
 
-			php_coverage_t *coverage = php_pcov_create(execute_data);
+			php_coverage_t *coverage = php_pcov_create(execute_data, file);
 
 			if (!PCG(start)) {
 				PCG(start) = coverage;
@@ -351,11 +361,11 @@ zend_op_array* php_pcov_compile_file(zend_file_handle *fh, int type) { /* {{{ */
 	return result;
 } /* }}} */
 
-static zend_never_inline void php_pcov_execute_traced(zend_execute_data *execute_data, zend_bool wanted) { /* {{{ */
+static zend_never_inline void php_pcov_execute_traced(zend_execute_data *execute_data, php_pcov_file_t *file) { /* {{{ */
 	int zrc		= 0;
 
 	while (1) {
-		zrc = php_pcov_trace(execute_data, wanted);
+		zrc = php_pcov_trace(execute_data, file);
 
 		if (zrc != SUCCESS) {
 			if (zrc < SUCCESS) {
@@ -363,13 +373,13 @@ static zend_never_inline void php_pcov_execute_traced(zend_execute_data *execute
 			}
 			/* The VM entered or left a function: the file of the frame is not the same */
 			execute_data = EG(current_execute_data);
-			wanted       = php_pcov_wants(EX(func)->op_array.filename);
+			file         = php_pcov_wants(EX(func)->op_array.filename);
 		}
 	}
 } /* }}} */
 
 void php_pcov_execute_ex(zend_execute_data *execute_data) { /* {{{ */
-	zend_bool wanted;
+	php_pcov_file_t *file;
 
 	if (UNEXPECTED(!PCG(active))) {
 		/*
@@ -382,9 +392,9 @@ void php_pcov_execute_ex(zend_execute_data *execute_data) { /* {{{ */
 	}
 
 	/* The answer is the same for each opcode of the function, so one look at the tables is enough */
-	wanted = php_pcov_wants(EX(func)->op_array.filename);
+	file = php_pcov_wants(EX(func)->op_array.filename);
 
-	if (php_pcov_route && !wanted) {
+	if (php_pcov_route && !file) {
 		/*
 		* Code outside pcov.directory is never reported, whatever start() and stop()
 		* do while it runs: the VM can execute it without a look at each opcode.
@@ -395,12 +405,14 @@ void php_pcov_execute_ex(zend_execute_data *execute_data) { /* {{{ */
 		return;
 	}
 
-	php_pcov_execute_traced(execute_data, wanted);
+	php_pcov_execute_traced(execute_data, file);
 } /* }}} */
 
-void php_pcov_covered_dtor(zval *zv) { /* {{{ */
-	zend_hash_destroy(Z_PTR_P(zv));
-	efree(Z_PTR_P(zv));
+void php_pcov_file_dtor(zval *zv) { /* {{{ */
+	php_pcov_file_t *file = Z_PTR_P(zv);
+
+	zend_hash_destroy(&file->covered);
+	efree(file);
 } /* }}} */
 
 void php_pcov_files_dtor(zval *zv) { /* {{{ */
@@ -530,9 +542,8 @@ PHP_RINIT_FUNCTION(pcov)
 	zend_hash_init(&PCG(files),      INI_INT("pcov.initial.files"), NULL, php_pcov_files_dtor, 0);
 	zend_hash_init(&PCG(waiting),    INI_INT("pcov.initial.files"), NULL, NULL, 0);
 	zend_hash_init(&PCG(ignores),    INI_INT("pcov.initial.files"), NULL, NULL, 0);
-	zend_hash_init(&PCG(wants),      INI_INT("pcov.initial.files"), NULL, NULL, 0);
+	zend_hash_init(&PCG(wants),      INI_INT("pcov.initial.files"), NULL, php_pcov_file_dtor, 0);
 	zend_hash_init(&PCG(discovered), INI_INT("pcov.initial.files"), NULL, ZVAL_PTR_DTOR, 0);
-	zend_hash_init(&PCG(covered),    INI_INT("pcov.initial.files"), NULL, php_pcov_covered_dtor, 0);
 
 	php_pcov_setup_directory(INI_STR("pcov.directory"));
 	php_pcov_setup_exclude(INI_STR("pcov.exclude"));
@@ -571,7 +582,6 @@ PHP_RSHUTDOWN_FUNCTION(pcov)
 	zend_hash_destroy(&PCG(wants));
 	zend_hash_destroy(&PCG(discovered));
 	zend_hash_destroy(&PCG(waiting));
-	zend_hash_destroy(&PCG(covered));
 
 	zend_arena_destroy(PCG(mem));
 
@@ -918,8 +928,20 @@ PHP_NAMED_FUNCTION(php_pcov_clear)
 	PCG(last) = NULL;
 	PCG(next) = NULL;
 
-	php_pcov_clean(&PCG(waiting));
-	php_pcov_clean(&PCG(covered));
+	if (PCG(waiting).nNumUsed) {
+		php_pcov_file_t *file;
+
+		/* The functions that run now keep a pointer to the record of their file */
+		ZEND_HASH_FOREACH_PTR(&PCG(wants), file) {
+			if (file->waiting) {
+				zend_hash_clean(&file->covered);
+
+				file->waiting = 0;
+			}
+		} ZEND_HASH_FOREACH_END();
+
+		zend_hash_clean(&PCG(waiting));
+	}
 } /* }}} */
 
 /* {{{ array \pcov\waiting(void) */
