@@ -47,6 +47,8 @@
 #define PHP_PCOV_UNCOVERED   -1
 #define PHP_PCOV_COVERED      1
 
+#define PHP_PCOV_LINES_PER_ELM (sizeof(zend_ulong) * 8)
+
 #ifndef GC_ADDREF
 #	define GC_ADDREF(g) ++GC_REFCOUNT(g)
 #endif
@@ -165,9 +167,9 @@ static zend_never_inline php_pcov_file_t* php_pcov_file_create(zend_string *file
 	php_pcov_file_t file;
 
 	file.name    = NULL;
+	file.covered = NULL;
+	file.size    = 0;
 	file.waiting = 0;
-
-	zend_hash_init(&file.covered, 64, NULL, NULL, 0);
 
 	return zend_hash_add_mem(
 		&PCG(wants), filename, &file, sizeof(php_pcov_file_t));
@@ -297,12 +299,31 @@ static zend_always_inline php_coverage_t* php_pcov_create(zend_execute_data *exe
 	return create;
 } /* }}} */
 
+static zend_never_inline void php_pcov_file_grow(php_pcov_file_t *file, uint32_t elm) { /* {{{ */
+	uint32_t size = file->size ? file->size * 2 : 16;
+
+	if (size <= elm) {
+		size = elm + 1;
+	}
+
+	file->covered = safe_erealloc(file->covered, size, sizeof(zend_ulong), 0);
+
+	memset(file->covered + file->size, 0, (size - file->size) * sizeof(zend_ulong));
+
+	file->size = size;
+} /* }}} */
+
 static zend_always_inline int php_pcov_has(php_pcov_file_t *file, uint32_t lineno) { /* {{{ */
-	if (EXPECTED(zend_hash_index_exists(&file->covered, lineno))) {
+	uint32_t   elm = lineno / PHP_PCOV_LINES_PER_ELM;
+	zend_ulong bit = Z_UL(1) << (lineno % PHP_PCOV_LINES_PER_ELM);
+
+	if (UNEXPECTED(elm >= file->size)) {
+		php_pcov_file_grow(file, elm);
+	} else if (EXPECTED(file->covered[elm] & bit)) {
 		return 1;
 	}
 
-	zend_hash_index_add_empty_element(&file->covered, lineno);
+	file->covered[elm] |= bit;
 	return 0;
 } /* }}} */
 
@@ -411,7 +432,9 @@ void php_pcov_execute_ex(zend_execute_data *execute_data) { /* {{{ */
 void php_pcov_file_dtor(zval *zv) { /* {{{ */
 	php_pcov_file_t *file = Z_PTR_P(zv);
 
-	zend_hash_destroy(&file->covered);
+	if (file->covered) {
+		efree(file->covered);
+	}
 	efree(file);
 } /* }}} */
 
@@ -934,7 +957,7 @@ PHP_NAMED_FUNCTION(php_pcov_clear)
 		/* The functions that run now keep a pointer to the record of their file */
 		ZEND_HASH_FOREACH_PTR(&PCG(wants), file) {
 			if (file->waiting) {
-				zend_hash_clean(&file->covered);
+				memset(file->covered, 0, file->size * sizeof(zend_ulong));
 
 				file->waiting = 0;
 			}

@@ -46,7 +46,8 @@ struct _php_coverage_t {
 /* {{{ a file that is traced: the key in the table is the name of the file */
 typedef struct _php_pcov_file_t {
 	zend_string    *name;    /* interned, set with the first line */
-	HashTable       covered; /* lines since the last clear */
+	zend_ulong     *covered; /* bit set of the lines since the last clear */
+	uint32_t        size;    /* elements of the bit set */
 	zend_bool       waiting; /* has lines since the last clear */
 } php_pcov_file_t; /* }}} */
 
