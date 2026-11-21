@@ -59,7 +59,7 @@
 #define GC_SET_REFCOUNT(ref, rc) (GC_REFCOUNT(ref) = (rc))
 #endif
 
-static zend_always_inline bool php_pcov_api_enabled(void) {
+static zend_always_inline zend_bool php_pcov_api_enabled(void) {
 	const char* env = getenv("PCOV_ENABLED");
 
 	if (env) {
@@ -69,39 +69,39 @@ static zend_always_inline bool php_pcov_api_enabled(void) {
 			switch (*env) {
 				case '1':
 				case 'y': /* short yes */
-					return true;
+					return 1;
 				case '0':
 				case 'n': /* short no */
-					return false;
+					return 0;
 			}
 			/* all other characters are assumed false */
-			return false;
+			return 0;
 		}
 
 		if (length == 2) {
 			if (strncasecmp(env, ZEND_STRL("on")) == SUCCESS) {
-				return true;
+				return 1;
 			} else if (strncasecmp(env, ZEND_STRL("no")) == SUCCESS) {
-				return false;
+				return 0;
 			}
 
 			/* all other strings are assumed false */
-			return false;
+			return 0;
 		}
 
 		if (length == 3) {
 			if (strncasecmp(env, ZEND_STRL("off")) == SUCCESS) {
-				return false;
+				return 0;
 			} else if (strncasecmp(env, ZEND_STRL("yes")) == SUCCESS) {
-				return true;
+				return 1;
 			}
 
 			/* all other strings are assumed false */
-			return false;
+			return 0;
 		}
 
 		/* all other lengths are assumed false */
-		return false;
+		return 0;
 	}
 
 	return INI_BOOL("pcov.enabled");
