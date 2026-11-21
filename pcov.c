@@ -116,6 +116,7 @@ static zval php_pcov_covered;
 static zend_ulong php_pcov_opcode_lut[256 / ZEND_BITSET_ELM_SIZE];
 
 void (*zend_execute_ex_function)(zend_execute_data *execute_data);
+static zend_bool php_pcov_route = 0;
 zend_op_array* (*zend_compile_file_function)(zend_file_handle *fh, int type) = NULL;
 
 ZEND_DECLARE_MODULE_GLOBALS(pcov)
@@ -350,7 +351,7 @@ zend_op_array* php_pcov_compile_file(zend_file_handle *fh, int type) { /* {{{ */
 	return result;
 } /* }}} */
 
-void php_pcov_execute_ex(zend_execute_data *execute_data) { /* {{{ */
+static zend_never_inline void php_pcov_execute_traced(zend_execute_data *execute_data) { /* {{{ */
 	int zrc		= 0;
 
 	while (1) {
@@ -363,6 +364,31 @@ void php_pcov_execute_ex(zend_execute_data *execute_data) { /* {{{ */
 			execute_data = EG(current_execute_data);
 		}
 	}
+} /* }}} */
+
+void php_pcov_execute_ex(zend_execute_data *execute_data) { /* {{{ */
+	if (UNEXPECTED(!PCG(active))) {
+		/*
+		* Code can run after RSHUTDOWN, for example a session handler
+		* that the session module calls in its own RSHUTDOWN:
+		* the tables of pcov do not exist at that point
+		*/
+		execute_ex(execute_data);
+		return;
+	}
+
+	if (php_pcov_route && !php_pcov_wants(EX(func)->op_array.filename)) {
+		/*
+		* Code outside pcov.directory is never reported, whatever start() and stop()
+		* do while it runs: the VM can execute it without a look at each opcode.
+		* A call from that code to a user function comes back to this function,
+		* because zend_execute_ex is not execute_ex
+		*/
+		execute_ex(execute_data);
+		return;
+	}
+
+	php_pcov_execute_traced(execute_data);
 } /* }}} */
 
 void php_pcov_covered_dtor(zval *zv) { /* {{{ */
@@ -390,6 +416,19 @@ PHP_MINIT_FUNCTION(pcov)
 	if (php_pcov_api_enabled()) {
 		zend_execute_ex_function   = zend_execute_ex;
 		zend_execute_ex            = php_pcov_execute_ex;
+
+		/*
+		* The VM can only run code outside pcov.directory on its own when every call
+		* of a user function in that code goes through zend_execute_ex. That is the case
+		* for code that was compiled after the line above: the compiler then does not use
+		* ZEND_DO_UCALL and ZEND_DO_FCALL_BY_NAME, which enter a function inside the VM.
+		*
+		* It is not the case when dl() loads pcov after code was compiled, and before PHP 8.0
+		* a file cache of OPcache can have code of a process that did not replace zend_execute_ex.
+		*/
+#if PHP_VERSION_ID >= 80000
+		php_pcov_route = (type == MODULE_PERSISTENT);
+#endif
 	}
 
 	ZVAL_LONG(&php_pcov_uncovered,   PHP_PCOV_UNCOVERED);
@@ -504,6 +543,8 @@ PHP_RINIT_FUNCTION(pcov)
 	PCG(last)  = NULL;
 	PCG(next)  = NULL;
 
+	PCG(active) = 1;
+
 	return SUCCESS;
 }
 /* }}} */
@@ -512,6 +553,8 @@ PHP_RINIT_FUNCTION(pcov)
  */
 PHP_RSHUTDOWN_FUNCTION(pcov)
 {
+	PCG(active) = 0;
+
 	if (!php_pcov_api_enabled() || CG(unclean_shutdown)) {
 		return SUCCESS;
 	}

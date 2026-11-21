@@ -45,6 +45,7 @@ struct _php_coverage_t {
 
 ZEND_BEGIN_MODULE_GLOBALS(pcov)
 	zend_bool         enabled;
+	zend_bool         active;
 	zend_arena       *mem;
 	php_coverage_t   *start;
 	php_coverage_t  **next;
