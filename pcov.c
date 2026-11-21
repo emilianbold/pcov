@@ -296,9 +296,9 @@ static zend_always_inline int php_pcov_has(zend_string *filename, uint32_t linen
 	return 0;
 } /* }}} */
 
-static zend_always_inline int php_pcov_trace(zend_execute_data *execute_data) { /* {{{ */
+static zend_always_inline int php_pcov_trace(zend_execute_data *execute_data, zend_bool wanted) { /* {{{ */
     if (PCG(enabled)) {
-		if (php_pcov_wants(EX(func)->op_array.filename) &&
+		if (wanted &&
 			!php_pcov_ignored_opcode(EX(opline)->opcode) &&
 			!php_pcov_has(EX(func)->op_array.filename, EX(opline)->lineno)) {
 
@@ -351,22 +351,26 @@ zend_op_array* php_pcov_compile_file(zend_file_handle *fh, int type) { /* {{{ */
 	return result;
 } /* }}} */
 
-static zend_never_inline void php_pcov_execute_traced(zend_execute_data *execute_data) { /* {{{ */
+static zend_never_inline void php_pcov_execute_traced(zend_execute_data *execute_data, zend_bool wanted) { /* {{{ */
 	int zrc		= 0;
 
 	while (1) {
-		zrc = php_pcov_trace(execute_data);
+		zrc = php_pcov_trace(execute_data, wanted);
 
 		if (zrc != SUCCESS) {
 			if (zrc < SUCCESS) {
 				return;
 			}
+			/* The VM entered or left a function: the file of the frame is not the same */
 			execute_data = EG(current_execute_data);
+			wanted       = php_pcov_wants(EX(func)->op_array.filename);
 		}
 	}
 } /* }}} */
 
 void php_pcov_execute_ex(zend_execute_data *execute_data) { /* {{{ */
+	zend_bool wanted;
+
 	if (UNEXPECTED(!PCG(active))) {
 		/*
 		* Code can run after RSHUTDOWN, for example a session handler
@@ -377,7 +381,10 @@ void php_pcov_execute_ex(zend_execute_data *execute_data) { /* {{{ */
 		return;
 	}
 
-	if (php_pcov_route && !php_pcov_wants(EX(func)->op_array.filename)) {
+	/* The answer is the same for each opcode of the function, so one look at the tables is enough */
+	wanted = php_pcov_wants(EX(func)->op_array.filename);
+
+	if (php_pcov_route && !wanted) {
 		/*
 		* Code outside pcov.directory is never reported, whatever start() and stop()
 		* do while it runs: the VM can execute it without a look at each opcode.
@@ -388,7 +395,7 @@ void php_pcov_execute_ex(zend_execute_data *execute_data) { /* {{{ */
 		return;
 	}
 
-	php_pcov_execute_traced(execute_data);
+	php_pcov_execute_traced(execute_data, wanted);
 } /* }}} */
 
 void php_pcov_covered_dtor(zval *zv) { /* {{{ */
