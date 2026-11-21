@@ -353,6 +353,16 @@ zend_op_array* php_pcov_compile_file(zend_file_handle *fh, int type) { /* {{{ */
 void php_pcov_execute_ex(zend_execute_data *execute_data) { /* {{{ */
 	int zrc		= 0;
 
+	if (UNEXPECTED(!PCG(active))) {
+		/*
+		* Code can run after RSHUTDOWN, for example a session handler
+		* that the session module calls in its own RSHUTDOWN:
+		* the tables of pcov do not exist at that point
+		*/
+		execute_ex(execute_data);
+		return;
+	}
+
 	while (1) {
 		zrc = php_pcov_trace(execute_data);
 
@@ -504,6 +514,8 @@ PHP_RINIT_FUNCTION(pcov)
 	PCG(last)  = NULL;
 	PCG(next)  = NULL;
 
+	PCG(active) = 1;
+
 	return SUCCESS;
 }
 /* }}} */
@@ -512,6 +524,8 @@ PHP_RINIT_FUNCTION(pcov)
  */
 PHP_RSHUTDOWN_FUNCTION(pcov)
 {
+	PCG(active) = 0;
+
 	if (!php_pcov_api_enabled() || CG(unclean_shutdown)) {
 		return SUCCESS;
 	}
